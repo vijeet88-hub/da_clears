@@ -130,7 +130,7 @@ def main():
         })
 
     df = pd.DataFrame(table_rows).set_index("ISO")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
     col1, col2 = st.columns([1, 3])
     with col1:
