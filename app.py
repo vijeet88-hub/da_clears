@@ -27,19 +27,19 @@ CACHE_TTL_SECONDS = 50   # < poll interval so each auto-rerun fetches fresh data
 ISOS = [
     {
         "key": "isone", "name": "ISO-NE", "location": "Internal Hub",
-        "brand": "#465C67", "accent": "#62C3EE", "icon": pine_tree,
+        "brand": "#465C67", "accent": "#62C3EE", "icon": pine_tree, "has_congestion": True,
     },
     {
         "key": "pjm", "name": "PJM", "location": "Western Hub",
-        "brand": "#003087", "accent": "#3D8EC7", "icon": liberty_bell,
+        "brand": "#003087", "accent": "#3D8EC7", "icon": liberty_bell, "has_congestion": True,
     },
     {
         "key": "nyiso", "name": "NYISO", "location": "Zone G · Hudson Valley",
-        "brand": "#0B5FFF", "accent": "#FF9900", "icon": skyline,
+        "brand": "#0B5FFF", "accent": "#FF9900", "icon": skyline, "has_congestion": True,
     },
     {
         "key": "ercot", "name": "ERCOT", "location": "Hub North",
-        "brand": "#1F8B9D", "accent": "#00AEC7", "icon": texas_star,
+        "brand": "#1F8B9D", "accent": "#00AEC7", "icon": texas_star, "has_congestion": False,
     },
 ]
 
@@ -60,6 +60,7 @@ CSS = """
     background: linear-gradient(160deg, var(--tint) 0%, #ffffff 55%);
     border-top: 7px solid var(--brand);
     box-shadow: 0 4px 18px rgba(0,0,0,0.10);
+    color-scheme: light;
 }
 .card-header { display: flex; align-items: center; gap: 14px; }
 .card-header .icon-wrap { flex-shrink: 0; }
@@ -110,7 +111,6 @@ def summarize(result):
         "he_end": result["he_end"],
         "avg_lmp": avg_lmp,
         "avg_cong": avg_cong,
-        "has_cong": bool(congestions),
         "lmp_series": [r["lmp"] for r in rows],
     }
 
@@ -148,6 +148,19 @@ def hex_to_rgba(hex_color, alpha):
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def hex_mix(hex_color, base_hex, ratio):
+    """Blend hex_color into base_hex as a fully OPAQUE hex color (not rgba
+    alpha) so the card background never shows the underlying Streamlit theme
+    (light or dark) bleeding through -- cards are always a light surface."""
+    hex_color, base_hex = hex_color.lstrip("#"), base_hex.lstrip("#")
+    r1, g1, b1 = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    r2, g2, b2 = (int(base_hex[i:i + 2], 16) for i in (0, 2, 4))
+    r = round(r1 * ratio + r2 * (1 - ratio))
+    g = round(g1 * ratio + g2 * (1 - ratio))
+    b = round(b1 * ratio + b2 * (1 - ratio))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def sparkline_svg(values, color):
     if not values:
         return ""
@@ -173,7 +186,7 @@ def sparkline_svg(values, color):
 
 def build_card_html(iso, summary, err):
     brand = iso["brand"]
-    tint = hex_to_rgba(brand, 0.07)
+    tint = hex_mix(brand, "#ffffff", 0.08)
     icon_svg = iso["icon"](brand)
 
     if err is not None:
@@ -196,15 +209,19 @@ def build_card_html(iso, summary, err):
     pct = round(100 * summary["hours"] / summary["expected"]) if summary["expected"] else 0
 
     lmp_display = f"${summary['avg_lmp']:.2f}" if summary["avg_lmp"] is not None else "—"
-    if summary["has_cong"]:
+
+    if not iso["has_congestion"]:
+        # Structural: this ISO's DA report has no congestion component at all
+        # (ERCOT hub SPPs), regardless of whether today's data has posted yet.
+        cong_display, cong_color, cong_label = "n/a", "#999", "NO CONGESTION COMPONENT"
+    elif summary["avg_cong"] is None:
+        # Has a congestion component, just not posted/available yet.
+        cong_display, cong_color, cong_label = "—", "#999", "ON-PEAK AVG CONGESTION"
+    else:
         cong_val = summary["avg_cong"]
         cong_display = f"${cong_val:.2f}"
         cong_color = "#C0392B" if cong_val > 5 else "#1A7A3E" if cong_val < -5 else "#666"
         cong_label = "ON-PEAK AVG CONGESTION"
-    else:
-        cong_display = "n/a"
-        cong_color = "#999"
-        cong_label = "NO CONGESTION COMPONENT"
 
     spark = sparkline_svg(summary["lmp_series"], accent)
 
