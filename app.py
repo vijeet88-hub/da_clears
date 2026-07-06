@@ -3,10 +3,14 @@ ISONE/PJM/NYISO/ERCOT email alerts (vijeet88-hub/isone-lmp-alert).
 
 Shows one card per ISO: on-peak avg LMP, on-peak avg congestion (blank for
 ERCOT, which has no component breakdown), posting status, and a small
-sparkline of the on-peak hourly shape. Auto-polls every 60s until all four
-ISOs have posted their full on-peak hour set, mirroring the email scripts'
-retry-until-complete behavior. Entirely cloud-side -- every card is a live
-HTTP fetch at render time, no local database or laptop dependency.
+sparkline of the on-peak hourly shape. Entirely cloud-side -- every card is
+a live HTTP fetch at render time, no local database or laptop dependency.
+
+Auto-refresh (every 60s) is gated to each ISO's scheduled polling window,
+matching the email alerts' cron kickoff times, and stops for that ISO the
+moment it posts -- never runs continuously all day:
+  NYISO 9:30-10:30 AM ET, ISO-NE 12:30-1:30 PM ET,
+  PJM 1:00-2:00 PM ET, ERCOT 1:30-2:30 PM ET
 """
 
 from datetime import datetime, timedelta
@@ -24,22 +28,28 @@ EASTERN = pytz.timezone("US/Eastern")
 POLL_INTERVAL_MS = 60_000
 CACHE_TTL_SECONDS = 50   # < poll interval so each auto-rerun fetches fresh data
 
+POLL_WINDOW_MINUTES = 60   # matches the email alerts' kickoff-to-deadline window
+
 ISOS = [
+    {
+        "key": "nyiso", "name": "NYISO", "location": "Zone G · Hudson Valley",
+        "brand": "#0B5FFF", "accent": "#FF9900", "icon": skyline, "has_congestion": True,
+        "poll_start": (9, 30),
+    },
     {
         "key": "isone", "name": "ISO-NE", "location": "Internal Hub",
         "brand": "#465C67", "accent": "#62C3EE", "icon": pine_tree, "has_congestion": True,
+        "poll_start": (12, 30),
     },
     {
         "key": "pjm", "name": "PJM", "location": "Western Hub",
         "brand": "#003087", "accent": "#3D8EC7", "icon": liberty_bell, "has_congestion": True,
-    },
-    {
-        "key": "nyiso", "name": "NYISO", "location": "Zone G · Hudson Valley",
-        "brand": "#0B5FFF", "accent": "#FF9900", "icon": skyline, "has_congestion": True,
+        "poll_start": (13, 0),
     },
     {
         "key": "ercot", "name": "ERCOT", "location": "Hub North",
         "brand": "#1F8B9D", "accent": "#00AEC7", "icon": texas_star, "has_congestion": False,
+        "poll_start": (13, 30),
     },
 ]
 
@@ -88,6 +98,7 @@ CSS = """
 }
 .progress-fill { height: 100%; border-radius: 3px; background: var(--brand); }
 .sparkline-wrap { margin-top: 14px; }
+.poll-note { font-size: 11px; color: #999; margin-top: 10px; font-weight: 500; }
 .error-text { font-size: 13px; color: #A62B2B; margin-top: 14px; font-family: monospace; }
 </style>
 """
@@ -95,6 +106,18 @@ CSS = """
 
 def next_operating_day():
     return datetime.now(EASTERN) + timedelta(days=1)
+
+
+def poll_window(iso, now):
+    """Today's (start, end) datetimes for this ISO's scheduled polling window."""
+    hour, minute = iso["poll_start"]
+    start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return start, start + timedelta(minutes=POLL_WINDOW_MINUTES)
+
+
+def format_window(start, end):
+    fmt = "%I:%M %p" if start.strftime("%p") != end.strftime("%p") else "%I:%M"
+    return f"{start.strftime(fmt).lstrip('0')}–{end.strftime('%I:%M %p').lstrip('0')} ET"
 
 
 def summarize(result):
@@ -184,7 +207,7 @@ def sparkline_svg(values, color):
     </svg>"""
 
 
-def build_card_html(iso, summary, err):
+def build_card_html(iso, summary, err, window_label, in_window):
     brand = iso["brand"]
     tint = hex_mix(brand, "#ffffff", 0.08)
     icon_svg = iso["icon"](brand)
@@ -225,6 +248,12 @@ def build_card_html(iso, summary, err):
 
     spark = sparkline_svg(summary["lmp_series"], accent)
 
+    poll_note = ""
+    if not summary["posted"]:
+        note = (f"Polling now · window closes {window_label.split('–')[1]}"
+                if in_window else f"Polls {window_label}")
+        poll_note = f'<div class="poll-note">{note}</div>'
+
     return f"""
     <div class="iso-card" style="--brand:{brand}; --tint:{tint};">
       <div class="card-header">
@@ -243,7 +272,7 @@ def build_card_html(iso, summary, err):
         <div class="metric-value-sub" style="color:{cong_color};">{cong_display}</div>
         <div class="metric-label-sub">{cong_label}</div>
       </div>
-      <div class="progress-track"><div class="progress-fill" style="width:{pct}%;"></div></div>
+      <div class="progress-track"><div class="progress-fill" style="width:{pct}%;"></div></div>{poll_note}
       <div class="sparkline-wrap">{spark}</div>
     </div>"""
 
@@ -274,12 +303,25 @@ def main():
         "ercot": (ercot_summary, ercot_err),
     }
 
-    all_posted = all(
-        err is None and summary["posted"] for summary, err in results.values()
-    )
+    now = datetime.now(EASTERN)
+    windows = {iso["key"]: poll_window(iso, now) for iso in ISOS}
+    in_window = {key: start <= now <= end for key, (start, end) in windows.items()}
+
+    is_posted = {
+        key: (err is None and summary["posted"]) for key, (summary, err) in results.items()
+    }
+    all_posted = all(is_posted.values())
+    # Auto-refresh only while some ISO is inside its scheduled window and hasn't
+    # posted yet -- stops for that ISO the moment it posts, even mid-window.
+    needs_poll = any(in_window[key] and not is_posted[key] for key in results)
 
     cards = "".join(
-        build_card_html(iso, *results[iso["key"]]) for iso in ISOS
+        build_card_html(
+            iso, *results[iso["key"]],
+            window_label=format_window(*windows[iso["key"]]),
+            in_window=in_window[iso["key"]],
+        )
+        for iso in ISOS
     )
     st.markdown(f'<div class="dashboard-grid">{cards}</div>', unsafe_allow_html=True)
 
@@ -291,11 +333,14 @@ def main():
             st.rerun()
     with col2:
         if all_posted:
-            st.success("All 4 ISOs posted — auto-refresh stopped.")
+            st.success("All 4 ISOs posted.")
+        elif needs_poll:
+            st.info(f"Auto-refreshing every {POLL_INTERVAL_MS // 1000}s "
+                     f"(inside a scheduled polling window)...")
         else:
-            st.info(f"Auto-refreshing every {POLL_INTERVAL_MS // 1000}s until all 4 ISOs post...")
+            st.info("Outside all scheduled polling windows — click Refresh to check now.")
 
-    if not all_posted:
+    if needs_poll:
         st_autorefresh(interval=POLL_INTERVAL_MS, key="poller")
 
 
